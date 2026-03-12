@@ -28,15 +28,15 @@ def run_optuna() -> None:
 
 
 def run_feature() -> None:
-    from src.model.feature_extraction import prepare_datasets_and_pipelines
+    from model.feature_extraction import prepare_datasets_and_pipelines
 
     prepare_datasets_and_pipelines()
 
 
 def run_split() -> None:
-    from src.data.split_dataset import split_dataset
+    from data.split_dataset import split_dataset2
 
-    split_dataset()
+    split_dataset2()
 
 
 def compile_model() -> None:

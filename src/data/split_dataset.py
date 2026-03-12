@@ -3,7 +3,7 @@ import pandas as pd
 from data.text_cleaning import split_dataset
 
 
-def split_dataset() -> None:
+def split_dataset2() -> None:
     df = pd.read_json("dataset/p2_dataset.json")
     train_df, val_df = split_dataset(df, test_size=0.1)
     val_df, test_df = split_dataset(val_df, test_size=0.5)

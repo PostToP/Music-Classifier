@@ -23,6 +23,8 @@ from config.config import (
     custom_stopwords,
 )
 
+
+
 # Download required NLTK resources
 nltk_download("words", quiet=True)
 nltk_download("stopwords", quiet=True)
@@ -273,23 +275,17 @@ class TextPreprocessor:
         filtered_artist_names.discard("")
         return filtered_artist_names
 
-    @staticmethod
-    def remove_wordpairs(text: str, filtered_artist_names: list[str]) -> str:
-        pattern = r"\b(?:" + r"|".join(map(re.escape, filtered_artist_names)) + r")\b"
-        return re.sub(pattern, "", text, flags=re.IGNORECASE)
 
-    @staticmethod
-    def build_wordpair_remover(filtered_artist_names: list[str]):
-        escaped = map(re.escape, filtered_artist_names)
-        pattern = re.compile(
-            rf"\b(?:{'|'.join(escaped)})\b",
-            flags=re.IGNORECASE,
-        )
+    def build_wordpair_remover(words: list[str]):
+        banned = set(w.lower() for w in words)
 
-        def remove_wordpairs(text: str) -> str:
-            return pattern.sub("", text)
-
-        return remove_wordpairs
+        def remove(text: str) -> str:
+            tokens = re.findall(r"\w+|\W+", text)
+            return "".join(
+                t for t in tokens
+                if not t.isalnum() or t.lower() not in banned
+            )
+        return remove
 
     @staticmethod
     def to_lower(text: str) -> str:
