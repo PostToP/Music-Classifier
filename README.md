@@ -79,3 +79,10 @@ Response:
 docker build -t ai-classifier .
 docker run --rm -p 5000:5000 ai-classifier
 ```
+
+Or pull and run the published image:
+
+```bash
+docker pull ghcr.io/posttop/ai-music:latest
+docker run --rm -p 5000:5000 ghcr.io/posttop/ai-music:latest
+```
