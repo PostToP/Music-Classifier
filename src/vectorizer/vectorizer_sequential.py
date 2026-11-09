@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import numpy as np
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -11,14 +14,21 @@ class VectorizerSequential(IVectorizer):
         self,
         vocab_size: int = 5000,
         max_sequence_length: int = 100,
+        excluded_tokens_path: str | None = None,
     ) -> None:
         self.vocab_size = vocab_size
         self.vectorizer = Tokenizer(WordLevel(unk_token="[UNK]"))
         self.output_dim = max_sequence_length
+        self.excluded_tokens_path = excluded_tokens_path
 
     def train(self, dataset: list[list[str]]) -> None:
+        excluded_tokens = set()
+        if self.excluded_tokens_path is not None:
+            excluded_tokens = set(json.loads(Path(self.excluded_tokens_path).read_text()))
+        kept_tokens = [[token for token in tokens if token not in excluded_tokens] for tokens in dataset]
+
         trainer = WordLevelTrainer(vocab_size=self.vocab_size, special_tokens=["[UNK]", "[PAD]"], show_progress=False)
-        self.vectorizer.train_from_iterator(dataset, trainer)
+        self.vectorizer.train_from_iterator(kept_tokens, trainer)
 
     def encode(self, text: list[str]) -> np.ndarray:
         sequence = self.vectorizer.encode(text, is_pretokenized=True)

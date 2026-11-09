@@ -1,7 +1,9 @@
 import pandas as pd
+from sklearn.base import BaseEstimator
 
 
-class IVectorizer:
+# scikit-learn >= 1.8 requires pipeline steps to inherit BaseEstimator (__sklearn_tags__).
+class IVectorizer(BaseEstimator):
     output_dim: int = 0
 
     def train(self, text: list[str]) -> None:

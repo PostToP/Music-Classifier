@@ -5,10 +5,11 @@ import numpy as np
 import pandas as pd
 from sklearn.pipeline import Pipeline
 
+from data.preprocess import ARTIST_TOKENS_PATH
 from tokenizer.tokenizer_whitespace import TokenizerWhitespace
-from vectorizer.vectorizer_bucket import VectorizerBucket
 from vectorizer.vectorizer_label import VectorizerLabel
-from vectorizer.vectorizer_sequential import VectorizerSequential
+from vectorizer.vectorizer_raw_number import VectorizerRawNumber
+from vectorizer.vectorizer_tfidf import VectorizerTFIDF
 
 logger = logging.getLogger("experiment")
 
@@ -17,13 +18,13 @@ FEATURES = {
     "Title": Pipeline(
         [
             ("tokenizer", TokenizerWhitespace()),
-            ("vectorizer", VectorizerSequential(8500, 20)),
+            ("vectorizer", VectorizerTFIDF(4000, excluded_tokens_path=ARTIST_TOKENS_PATH)),
         ],
     ),
     "Description": Pipeline(
         [
             ("tokenizer", TokenizerWhitespace()),
-            ("vectorizer", VectorizerSequential(5000, 30)),
+            ("vectorizer", VectorizerTFIDF(4000, excluded_tokens_path=ARTIST_TOKENS_PATH)),
         ],
     ),
     "Categories": Pipeline(
@@ -33,15 +34,15 @@ FEATURES = {
     ),
     "Duration": Pipeline(
         [
-            ("vectorizer", VectorizerBucket([0, 60, 180, 360, 9999999])),
+            ("vectorizer", VectorizerRawNumber()),
         ],
     ),
 }
 
 
-def transform_features(df, fit=False) -> dict:
+def transform_features(df, fit=False, pipelines: dict[str, Pipeline] = FEATURES) -> dict:
     outputs = {}
-    for col_name, pipeline in FEATURES.items():
+    for col_name, pipeline in pipelines.items():
         if fit:
             outputs[col_name] = pipeline.fit_transform(df[col_name]).to_numpy()
         else:

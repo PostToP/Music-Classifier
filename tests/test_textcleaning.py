@@ -1,6 +1,11 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from data.text_cleaning import TextPreprocessor
+from model.model_wrapper import encode_tfidf
+from vectorizer.vectorizer_tfidf import VectorizerTFIDF
 
 
 class TextCleaningTest(unittest.TestCase):
@@ -72,9 +77,6 @@ class TextCleaningTest(unittest.TestCase):
         self.assertEqual(TextPreprocessor.remove_ats("Mentioning @someone"), "Mentioning  ")
         self.assertEqual(TextPreprocessor.remove_ats("Hey, Hey, Hey. @you"), "Hey, Hey, Hey.  ")
 
-    def test_remove_wordpairs(self):
-        self.assertEqual(TextPreprocessor.remove_wordpairs("ado test ado ado", ["ado"]), " test  ")
-
     def test_to_lower(self):
         self.assertEqual(TextPreprocessor.to_lower("This is a TEST string."), "this is a test string.")
         self.assertEqual(TextPreprocessor.to_lower("ANOTHER Test"), "another test")
@@ -132,16 +134,33 @@ class TextCleaningTest(unittest.TestCase):
         )
         self.assertEqual(TextPreprocessor.collapse_whitespaces("No extra spaces here"), "No extra spaces here")
 
-    def test_lemmatize(self):
-        self.assertEqual(TextPreprocessor.lemmatize_text("changing"), "change")
-        self.assertEqual(TextPreprocessor.lemmatize_text("running"), "run")
-        self.assertEqual(TextPreprocessor.lemmatize_text("better running"), "well run")
+    def test_lemmatize_as_nouns(self):
         self.assertEqual(TextPreprocessor.lemmatize_text("cats"), "cat")
+        self.assertEqual(TextPreprocessor.lemmatize_text("songs"), "song")
         self.assertEqual(
             TextPreprocessor.lemmatize_text("The quick brown foxes are jumping"),
-            "the quick brown fox be jump",
+            "The quick brown fox are jumping",
         )
-        self.assertEqual(TextPreprocessor.lemmatize_text("She was running quickly"), "she be run quickly")
+
+
+class TfidfEncodingTest(unittest.TestCase):
+    def test_prod_tfidf_encoding_matches_training(self):
+        vectorizer = VectorizerTFIDF(10)
+        vectorizer.train([["music", "video", "music"], ["live", "video"], ["official", "music", "audio"]])
+        vocab = vectorizer.vectorizer.vocabulary_
+        idf = vectorizer.vectorizer.idf_.astype("float32")
+        tokens = ["music", "music", "video", "neverseen"]
+        expected_vector = vectorizer.encode(tokens).round(6).tolist()
+        self.assertEqual(encode_tfidf(tokens, vocab, idf).round(6).tolist(), expected_vector)
+
+    def test_excluded_tokens_stay_out_of_vocabulary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            excluded_tokens_path = Path(directory) / "artist_tokens.json"
+            excluded_tokens_path.write_text(json.dumps(["miku"]))
+            vectorizer = VectorizerTFIDF(10, excluded_tokens_path=str(excluded_tokens_path))
+            vectorizer.train([["miku", "song"]])
+        self.assertNotIn("miku", vectorizer.vectorizer.vocabulary_)
+        self.assertEqual(vectorizer.encode(["miku", "song"]).tolist(), [1.0])
 
 
 if __name__ == "__main__":

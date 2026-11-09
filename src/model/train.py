@@ -1,203 +1,284 @@
+from __future__ import annotations
+
+import copy
 import logging
+from dataclasses import asdict, dataclass
 
 import numpy as np
-import optuna
-import pandas as pd
-import tensorflow as tf
-from tensorflow.keras import layers, regularizers
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
-from tensorflow.keras.layers import (
-    Input,
+import torch
+from torch import Tensor
+from torch.nn.utils import clip_grad_norm_
+from torch.utils.data import BatchSampler, DataLoader, Dataset, RandomSampler, SequentialSampler
+
+from model.pytorch_model import (
+    MusicClassifier,
+    TorchModelConfig,
+    build_config_from_params,
+    print_model_summary,
+    save_model_artifacts,
 )
-from tensorflow.keras.models import Model
 
 logger = logging.getLogger("experiment")
 
-
-def build_model(params: dict) -> Model:
-    inputs = []
-    valami = []
-    paths = ["title", "desc", "cat", "dur"]
-
-    for path in paths:
-        inputs.append(Input(shape=(params[f"{path}_input_dim"],), name=f"{path}_input"))
-        x = inputs[-1]
-        if f"{path}_embed_dim" in params:
-            x = layers.Embedding(
-                input_dim=params[f"{path}_vocab_size"],
-                output_dim=2 ** params[f"{path}_embed_dim"],
-            )(inputs[-1])
-            x = layers.GlobalAveragePooling1D()(x)
-        n_layers = params[f"n_{path}_layers"]
-        for i in range(n_layers):
-            x = layers.Dense(
-                2 ** params[f"{path}_units_{i}"],
-                activation=params[f"{path}_activation_{i}"],
-                kernel_regularizer=regularizers.l2(params[f"{path}_l2_{i}"]),
-            )(x)
-            x = layers.Dropout(params[f"{path}_dropout_{i}"])(x)
-        valami.append(x)
-
-    combined = layers.concatenate(valami)
-    x = combined
-
-    # --- Post-processing layers ---
-    n_post_layers = params["n_post_layers"]
-    for i in range(n_post_layers):
-        x = layers.Dense(
-            params[f"post_units_{i}"],
-            activation=params[f"post_activation_{i}"],
-            kernel_regularizer=regularizers.l2(params[f"post_l2_{i}"]),
-        )(x)
-        x = layers.Dropout(params[f"post_dropout_{i}"])(x)
-
-    output = layers.Dense(1, activation="sigmoid")(x)
-    model = Model(inputs=inputs, outputs=output)
-    return model
+TOTAL_EPOCHS = 5000
+BATCH_SIZE = 1024
+EARLY_STOPPING_PATIENCE = 20
+EARLY_STOPPING_MIN_DELTA = 0.0001
+PREDICTION_THRESHOLD = 0.5
 
 
-def load_split(path: str) -> tuple:
+@dataclass(frozen=True, slots=True)
+class OptimizerSettings:
+    learning_rate: float
+    weight_decay: float
+
+
+class SplitDataset(Dataset):
+    """A whole split held on the training device, so batches are sliced there instead of copied from host memory."""
+
+    def __init__(self, inputs: list[np.ndarray], labels: np.ndarray, device: torch.device) -> None:
+        self.title_vectors = torch.as_tensor(inputs[0], dtype=torch.float32, device=device)
+        self.description_vectors = torch.as_tensor(inputs[1], dtype=torch.float32, device=device)
+        self.categories = torch.as_tensor(inputs[2], dtype=torch.float32, device=device)
+        self.duration = torch.as_tensor(inputs[3], dtype=torch.float32, device=device)
+        self.labels = torch.as_tensor(labels, dtype=torch.float32, device=device).view(-1, 1)
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, index: int) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        return (
+            self.title_vectors[index],
+            self.description_vectors[index],
+            self.categories[index],
+            self.duration[index],
+            self.labels[index],
+        )
+
+
+def load_split(path: str) -> tuple[list[np.ndarray], np.ndarray]:
     data = np.load(path, allow_pickle=True)
-    X = [
+    inputs = [
         data["YT_ID"],
         data["Title"],
         data["Description"],
         data["Categories"],
         data["Duration"],
     ]
-    y = data["Labels"]
-    return X, y
+    labels = data["Labels"]
+    return inputs, labels
 
 
-def train_and_evaluate(
-    train_df: tuple,
-    test_df: tuple,
-    val_df: tuple,
-    model_params: dict,
-) -> tuple[Model, float, float]:
+def _build_batch_loader(dataset: SplitDataset, *, shuffle: bool) -> DataLoader:
+    # Indexing whole batches at once; per-item __getitem__ plus collate left the GPU idle.
+    sampler = RandomSampler(dataset) if shuffle else SequentialSampler(dataset)
+    return DataLoader(dataset, sampler=BatchSampler(sampler, BATCH_SIZE, drop_last=False), batch_size=None)
+
+
+def _accuracy(probabilities: Tensor, labels: Tensor) -> float:
+    predictions = (probabilities >= PREDICTION_THRESHOLD).float()
+    return (predictions == labels).float().mean().item()
+
+
+def _evaluate(
+    model: MusicClassifier,
+    loader: DataLoader,
+    criterion: torch.nn.Module,
+) -> tuple[float, float]:
+    model.eval()
+    total_loss = 0.0
+    total_correct = 0.0
+    total_items = 0
+
+    with torch.no_grad():
+        for title_batch, description_batch, category_batch, duration_batch, label_batch in loader:
+            logits = model(title_batch, description_batch, category_batch, duration_batch)
+            loss = criterion(logits, label_batch) + model.regularization_loss()
+            probabilities = torch.sigmoid(logits)
+            predictions = (probabilities >= PREDICTION_THRESHOLD).float()
+
+            batch_size = label_batch.size(0)
+            total_loss += loss.item() * batch_size
+            total_correct += (predictions == label_batch).sum().item()
+            total_items += batch_size
+
+    return total_loss / max(total_items, 1), total_correct / max(total_items, 1)
+
+
+def _train_one_epoch(
+    model: MusicClassifier,
+    loader: DataLoader,
+    criterion: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> tuple[float, float]:
+    model.train()
+    total_loss = 0.0
+    total_correct = 0.0
+    total_items = 0
+
+    for title_batch, description_batch, category_batch, duration_batch, label_batch in loader:
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(title_batch, description_batch, category_batch, duration_batch)
+        loss = criterion(logits, label_batch) + model.regularization_loss()
+        loss.backward()
+        clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        probabilities = torch.sigmoid(logits)
+        batch_size = label_batch.size(0)
+        total_loss += loss.item() * batch_size
+        total_correct += _accuracy(probabilities, label_batch) * batch_size
+        total_items += batch_size
+
+    return total_loss / max(total_items, 1), total_correct / max(total_items, 1)
+
+
+def _make_example_inputs(train_inputs: list[np.ndarray], device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    return (
+        torch.zeros((1, train_inputs[0].shape[1]), dtype=torch.float32, device=device),
+        torch.zeros((1, train_inputs[1].shape[1]), dtype=torch.float32, device=device),
+        torch.zeros((1, train_inputs[2].shape[1]), dtype=torch.float32, device=device),
+        torch.zeros((1, train_inputs[3].shape[1]), dtype=torch.float32, device=device),
+    )
+
+
+def _format_epoch_line(
+    epoch: int,
+    train_accuracy: float,
+    train_loss: float,
+    val_accuracy: float,
+    val_loss: float,
+    learning_rate: float,
+) -> str:
+    return (
+        f"{epoch}/{TOTAL_EPOCHS} ━━━━━━━━━━━━━━━━━━━━ "
+        f"- accuracy: {train_accuracy:.4f} - loss: {train_loss:.4f} "
+        f"- val_accuracy: {val_accuracy:.4f} - val_loss: {val_loss:.4f} "
+        f"- learning_rate: {learning_rate:.4e}"
+    )
+
+
+def fit_model(
+    config: TorchModelConfig,
+    train_df: tuple[list[np.ndarray], np.ndarray],
+    val_df: tuple[list[np.ndarray], np.ndarray],
+    optimizer_settings: OptimizerSettings,
+    *,
+    verbose: bool = True,
+) -> tuple[MusicClassifier, float]:
+    """Train with early stopping on validation loss; returns the best-epoch model and that loss."""
     train_inputs = train_df[0]
-    val_inputs = val_df[0]
-    test_inputs = test_df[0]
+    model = MusicClassifier(config)
 
-    train_labels = train_df[1]
-    val_labels = val_df[1]
-    test_labels = test_df[1]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
-    print(train_inputs[0].shape)
+    train_loader = _build_batch_loader(SplitDataset(train_inputs, train_df[1], device), shuffle=True)
+    val_loader = _build_batch_loader(SplitDataset(val_df[0], val_df[1], device), shuffle=False)
 
-    model_params["title_input_dim"] = train_inputs[0].shape[1]
-    model_params["desc_input_dim"] = train_inputs[1].shape[1]
-    model_params["cat_input_dim"] = train_inputs[2].shape[1]
-    model_params["dur_input_dim"] = 1 if len(train_inputs[3].shape) == 1 else train_inputs[3].shape[1]
+    if verbose:
+        print_model_summary(model, _make_example_inputs(train_inputs, device))
+        logger.info("Compiling model")
 
-    model = build_model(model_params)
-
-    optimizer = tf.keras.optimizers.AdamW(
-        learning_rate=1e-3,
-        weight_decay=1e-5,
-        clipnorm=1.0,
+    criterion = torch.nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=optimizer_settings.learning_rate,
+        weight_decay=optimizer_settings.weight_decay,
     )
-    model.compile(
-        optimizer=optimizer,
-        loss="binary_crossentropy",
-        metrics=["accuracy"],
-    )
-    reduce_lr = ReduceLROnPlateau(
-        monitor="val_loss",
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
         factor=0.5,
         patience=10,
         min_lr=1e-6,
-        verbose=1,
-    )
-    anti_overfit = EarlyStopping(
-        monitor="val_loss",
-        patience=20,
-        restore_best_weights=True,
-        mode="min",
-        min_delta=0.0001,
-    )
-    model.fit(
-        train_inputs,
-        train_labels,
-        epochs=5000,
-        batch_size=1024,
-        validation_data=(val_inputs, val_labels),
-        callbacks=[anti_overfit, reduce_lr],
-        shuffle=True,
     )
 
-    loss, acc = model.evaluate(test_inputs, test_labels, verbose=2)
-    logger.info(f"Validation accuracy: {acc}, loss: {loss}")
+    best_state = copy.deepcopy(model.state_dict())
+    best_val_loss = float("inf")
+    patience_counter = 0
 
-    return model, loss, acc
+    for epoch in range(1, TOTAL_EPOCHS + 1):
+        train_loss, train_accuracy = _train_one_epoch(model, train_loader, criterion, optimizer)
+        val_loss, val_accuracy = _evaluate(model, val_loader, criterion)
+        scheduler.step(val_loss)
+        learning_rate = optimizer.param_groups[0]["lr"]
 
-
-def flag_suspicious_rows(
-    model: Model,
-) -> pd.DataFrame:
-    train_df = load_split("dataset/p4_train.npz")
-    val_df = load_split("dataset/p4_val.npz")
-    test_df = load_split("dataset/p4_test.npz")
-
-    all_inputs = []
-    for i in range(len(train_df[0])):
-        all_inputs.append(
-            np.concatenate(
-                [
-                    train_df[0][i],
-                    val_df[0][i],
-                    test_df[0][i],
-                ],
-                axis=0,
+        if verbose:
+            print(f"Epoch {epoch}/{TOTAL_EPOCHS}")
+            print(
+                _format_epoch_line(
+                    epoch,
+                    train_accuracy,
+                    train_loss,
+                    val_accuracy,
+                    val_loss,
+                    learning_rate,
+                ),
             )
-        )
-    all_labels = np.concatenate(
-        [
-            train_df[1],
-            val_df[1],
-            test_df[1],
-        ],
-        axis=0,
-    )
+            logger.info(
+                "Epoch %s: train_loss=%.6f train_acc=%.4f val_loss=%.6f val_acc=%.4f lr=%.6e",
+                epoch,
+                train_loss,
+                train_accuracy,
+                val_loss,
+                val_accuracy,
+                learning_rate,
+            )
 
-    train_inputs = all_inputs[1:]  # skip YT_ID
-    train_labels = all_labels
+        if val_loss < best_val_loss - EARLY_STOPPING_MIN_DELTA:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= EARLY_STOPPING_PATIENCE:
+                logger.info("Early stopping after %s epochs", epoch)
+                break
 
-    train_preds = model.predict(train_inputs, batch_size=1024).flatten()
-    train_labels_array = train_labels.astype(np.float32).flatten()
-
-    epsilon = 1e-7
-    train_preds_clipped = np.clip(train_preds, epsilon, 1 - epsilon)
-    train_loss = -(
-        train_labels_array * np.log(train_preds_clipped) + (1 - train_labels_array) * np.log(1 - train_preds_clipped)
-    )
-
-    confidence = np.abs(train_preds - 0.5) * 2
-    pred_label = (train_preds > 0.5).astype(int)
-
-    disagree = pred_label != train_labels_array
-    loss_thresh = np.percentile(train_loss, 90)
-
-    suspect_mask = (train_loss > loss_thresh) & (confidence > 0.8) & disagree
-    suspect_row_ids = np.where(suspect_mask)[0]
-    logger.warning(f"Flagged {len(suspect_row_ids)} suspicious rows")
-
-    suspect_rows = all_inputs[0][suspect_row_ids]
-    original_dataset = pd.read_json("dataset/videos.json")
-    yt_id_to_index = {yt_id: idx for idx, yt_id in enumerate(original_dataset["YT ID"])}
-    suspect_rows = [yt_id_to_index[yt_id] for yt_id in suspect_rows if yt_id in yt_id_to_index]
-
-    suspect_rows_df = original_dataset.iloc[suspect_rows]
-    suspect_rows_df = suspect_rows_df.assign(
-        Predicted_Probability=train_preds[suspect_row_ids],
-        Predicted_Label=pred_label[suspect_row_ids],
-        Loss=train_loss[suspect_row_ids],
-    )
-    suspect_rows_df = suspect_rows_df.sort_values(by="Loss", ascending=False)
-    suspect_rows_df.to_csv("model/suspect_rows.csv", index=False)
+    model.load_state_dict(best_state)
+    return model, best_val_loss
 
 
-def create_model() -> None:
+def predict_probabilities(model: MusicClassifier, inputs: list[np.ndarray]) -> np.ndarray:
+    labels_placeholder = np.zeros(len(inputs[0]), dtype=np.float32)
+    device = next(model.parameters()).device
+    loader = _build_batch_loader(SplitDataset(inputs, labels_placeholder, device), shuffle=False)
+    model.eval()
+
+    probability_batches = []
+    with torch.no_grad():
+        for title_batch, description_batch, category_batch, duration_batch, _ in loader:
+            logits = model(title_batch, description_batch, category_batch, duration_batch)
+            probability_batches.append(torch.sigmoid(logits).cpu().numpy().flatten())
+
+    return np.concatenate(probability_batches)
+
+
+def train_and_evaluate(
+    train_df: tuple[list[np.ndarray], np.ndarray],
+    test_df: tuple[list[np.ndarray], np.ndarray],
+    val_df: tuple[list[np.ndarray], np.ndarray],
+    params: dict,
+) -> tuple[MusicClassifier, float, float, dict[str, int]]:
+    train_inputs = train_df[0]
+
+    input_dims = [inputs.shape[1] for inputs in train_inputs]
+    config = build_config_from_params(params, *input_dims)
+    optimizer_settings = OptimizerSettings(params["learning_rate"], params["weight_decay"])
+    model, _best_val_loss = fit_model(config, train_df, val_df, optimizer_settings)
+
+    device = next(model.parameters()).device
+    test_loader = _build_batch_loader(SplitDataset(test_df[0], test_df[1], device), shuffle=False)
+    test_loss, test_accuracy = _evaluate(model, test_loader, torch.nn.BCEWithLogitsLoss())
+    print(f"{len(test_loader)}/{len(test_loader)} ━━━━━━━━━━━━━━━━━━━━")
+    print(f"Validation accuracy: {test_accuracy}, loss: {test_loss}")
+    logger.info("Validation accuracy: %s, loss: %s", test_accuracy, test_loss)
+
+    return model, test_loss, test_accuracy, asdict(config)
+
+
+def create_model(params: dict) -> None:
     train_df = load_split("dataset/p4_train.npz")
     val_df = load_split("dataset/p4_val.npz")
     test_df = load_split("dataset/p4_test.npz")
@@ -206,33 +287,13 @@ def create_model() -> None:
     val_df = (val_df[0][1:], val_df[1])
     test_df = (test_df[0][1:], test_df[1])
 
-    logger.info("Compiling model")
-
-    model_params = {
-        "title_vocab_size": 8500,
-        "title_embed_dim": 20,
-        "desc_vocab_size": 5000,
-        "desc_embed_dim": 30,
-        "dur_vocab_size": 4,
-    }
-
-    storage_name = "sqlite:///optuna_study.db"
-    study = optuna.load_study(
-        study_name="hypeparam_tuning",
-        storage=storage_name,
-    )
-
-    best_params = study.best_trials[0].params
-    model_params.update(best_params)
-
-    model, _loss, _acc = train_and_evaluate(
+    model, _loss, _acc, config = train_and_evaluate(
         train_df,
         test_df,
         val_df,
-        model_params,
+        params,
     )
 
-    flag_suspicious_rows(model)
-    model.summary()
+    logger.info("Model configuration: %s", config)
 
-    model.save("model/final_model.keras")
+    save_model_artifacts(model, model.config, "model/final_model.pt", "model/final_model_config.json")

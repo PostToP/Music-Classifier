@@ -79,4 +79,4 @@ custom_keepwords = [
 ]
 
 
-custom_artist_blocklist = ["ado", "eve", "utsu", "teto"]
+custom_artist_blocklist = ["ado", "eve", "utsu", "teto", "delutaya"]

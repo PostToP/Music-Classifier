@@ -1,7 +1,5 @@
 import sys
 
-import log
-
 
 def run_fetch() -> None:
     from data.database import main as fetch_videos
@@ -17,12 +15,13 @@ def run_preprocess() -> None:
 
 def run_train() -> None:
     from model.train import create_model
+    from model.tuning import fetch_best_params
 
-    create_model()
+    create_model(fetch_best_params())
 
 
 def run_optuna() -> None:
-    from model.optuna import main as optuna_main
+    from model.tuning import main as optuna_main
 
     optuna_main()
 
@@ -37,6 +36,12 @@ def run_split() -> None:
     from data.split_dataset import split_dataset2
 
     split_dataset2()
+
+
+def run_label_errors() -> None:
+    from model.label_errors import find_label_error_candidates
+
+    find_label_error_candidates()
 
 
 def compile_model() -> None:
@@ -54,9 +59,10 @@ def main() -> None:
         "train": run_train,
         "compile": compile_model,
         "optuna": run_optuna,
+        "labelerrors": run_label_errors,
     }
 
-    if len(sys.argv) < 2:
+    if not sys.argv[1:]:
         print("Usage: python cli.py <operations>")
         print(f"Available operations: {', '.join(COMMANDS.keys())}")
         return

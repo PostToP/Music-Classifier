@@ -52,6 +52,24 @@ FROM
     return videos
 
 
+def fetch_labelled_video_prod_predictions() -> list[tuple]:
+    """Every labelled video with its default language and the prod model's probability (NULL if never predicted)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""SELECT
+    v.yt_id,
+    v.default_language,
+    imvp.prediction
+FROM
+    posttop.video v
+    INNER JOIN posttop.is_music_video imv ON v.id = imv.video_id
+    LEFT JOIN posttop.is_music_video_prediction imvp ON v.id = imvp.video_id;""")
+    prediction_rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return prediction_rows
+
+
 def convert_postgres_videos_to_json(videos: list[tuple]) -> list[dict]:
     all_vids = []
     for video in videos:

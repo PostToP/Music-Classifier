@@ -1,4 +1,8 @@
-class ITokenizer:
+from sklearn.base import BaseEstimator
+
+
+# scikit-learn >= 1.8 requires pipeline steps to inherit BaseEstimator (__sklearn_tags__).
+class ITokenizer(BaseEstimator):
     def train(self, text: list[str]) -> None:
         pass
 
