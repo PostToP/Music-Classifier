@@ -81,16 +81,9 @@ docker build -t ai-classifier .
 docker run --rm -p 5000:5000 ai-classifier
 ```
 
-Publish (after `python src/cli.py compile` has written `model/model_wrapper.npz`):
-
-```bash
-docker build -t forgejo.devla.dev/devla/posttop-ai:latest .
-docker push forgejo.devla.dev/devla/posttop-ai:latest
-```
-
 Or pull and run the published image:
 
 ```bash
-docker pull forgejo.devla.dev/devla/posttop-ai:latest
-docker run --rm -p 5000:5000 forgejo.devla.dev/devla/posttop-ai:latest
+docker pull ghcr.io/posttop/ai-music:latest
+docker run --rm -p 5000:5000 ghcr.io/posttop/ai-music:latest
 ```
